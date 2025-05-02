@@ -1,6 +1,6 @@
 import { Builder } from 'selenium-webdriver';
 import chrome from 'selenium-webdriver/chrome.js';
-import { readFile, writeFile, open, stat } from 'node:fs/promises';
+import { readFile, writeFile, open, stat, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -98,45 +98,79 @@ async function processWebPost(pageName) {
 
     // Extract post metadata
     const postUrl = post.find('a[href*="/posts/"]').attr('href')?.split('?')[0];
-    const fullPostUrl = postUrl ? `${config.FB_URL}/${postUrl}` : null;
+    const fullPostUrl = postUrl ? `${postUrl}` : null;
 
     // Check for existing post
     if (storage.posts[pageName]?.url === fullPostUrl) return null;
 
+    // New: Extract embedded link metadata
+    const linkPreview = post.find([
+      'div[data-lynx-uri]',
+      'div.x1lq5wgf', // Example class-based selector
+      'a[role="link"][target="_blank"]'
+    ].join(',')).first();
+
+    let embeddedLink = null;
+
+    if (linkPreview.length) {
+      try {
+        const rawUrl = linkPreview.attr('data-lynx-uri') ||
+          linkPreview.find('a').attr('href') ||
+          linkPreview.closest('a').attr('href');
+
+        embeddedLink = {
+          url: extractUrl(decodeURIComponent(rawUrl)),
+          // Keep existing title/image extraction if needed
+        };
+
+        // Special case for image-only links
+        if (!embeddedLink.url.startsWith('http')) {
+          const imgParentLink = linkPreview.find('img').closest('a').attr('href');
+          if (imgParentLink) {
+            embeddedLink.url = extractUrl(imgParentLink);
+          }
+        }
+      } catch (error) {
+        console.error('Link processing error:', error);
+      }
+    }
     // Extract content
     const content = {
       text: post.find('div[data-ad-preview="message"]').text().trim(),
       media: [],
       url: fullPostUrl,
+      embeddedLink: embeddedLink, // Add embedded link metadata
       timestamp: new Date().toISOString()
     };
 
-    // Handle videos
-    const videoElement = post.find('video');
-    if (videoElement.length) {
-      const videoSrc = videoElement.attr('src');
-      if (videoSrc) {
-        const videoPath = await downloadMedia(pageName, videoSrc, 'video');
-        content.media.push({ type: 'video', path: videoPath });
-      }
-    }
-
-    // Handle images
-    const images = post.find('img');
-    images.each(async (imgIndex, img) => {
-      const imageUrl = $(img).attr('src');
-
-      if (imageUrl && imageUrl.startsWith('http')) {
-        // First check image size via HEAD request
-        const headResponse = await axios.head(imageUrl);
-        const contentLength = headResponse.headers['content-length'];
-
-        if (contentLength && parseInt(contentLength) > 2048) {
-          const imgPath = await downloadMedia(pageName, imageUrl, 'image', imgIndex);
-          content.media.push({ type: 'image', path: imgPath });
+    if (!embeddedLink) {
+      // Handle videos
+      const videoElement = post.find('video');
+      if (videoElement.length) {
+        const videoSrc = videoElement.attr('src');
+        if (videoSrc) {
+          const videoPath = await downloadMedia(pageName, videoSrc, 'video');
+          content.media.push({ type: 'video', path: videoPath });
         }
       }
-    });
+
+      // Handle images
+      const images = post.find('img');
+      images.each(async (imgIndex, img) => {
+        const imageUrl = $(img).attr('src');
+
+        if (imageUrl && imageUrl.startsWith('http')) {
+          // First check image size via HEAD request
+          const headResponse = await axios.head(imageUrl);
+          const contentLength = headResponse.headers['content-length'];
+
+          if (contentLength && parseInt(contentLength) > 2048) {
+            const imgPath = await downloadMedia(pageName, imageUrl, 'image', imgIndex);
+            content.media.push({ type: 'image', path: imgPath });
+          }
+        }
+      });
+    }
 
     // Update storage
     storage.posts[pageName] = {
@@ -184,39 +218,89 @@ async function downloadMedia(pageName, url, type, index = 0) {
   }
 }
 
+function extractUrl(url) {
+  try {
+    let currentUrl = url;
+
+    const urlParams = new URL(currentUrl).searchParams;
+    if (urlParams.has('u')) {
+      currentUrl = decodeURIComponent(urlParams.get('u'));
+    }
+    if (urlParams.has('url')) {
+      currentUrl = decodeURIComponent(urlParams.get('url'));
+    }
+
+    // Handle multiple encoding layers
+    let previousUrl;
+    do {
+      previousUrl = currentUrl;
+      const decoded = decodeURIComponent(currentUrl);
+      currentUrl = decoded.startsWith('http') ? decoded : currentUrl;
+    } while (currentUrl !== previousUrl);
+
+    return currentUrl;
+  } catch (error) {
+    console.error('URL extraction error:', error);
+    return url;
+  }
+}
+
 async function sendDiscordMessage(pageConfig, content) {
   const [pageName, channelId] = pageConfig;
   const channel = await discordClient.channels.fetch(channelId);
+  const filesToDelete = [];
 
   const message = {
     content: `**${pageName}**\n${content.text}`,
     files: []
   };
 
-  // Add media attachments (Discord limit: 25MB)
-  for (const media of content.media) {
-    try {
-      if (media.path) {
-        const fileStats = await stat(media.path);
-        if (fileStats.size < 25_000_000) {
-          message.files.push({
-            attachment: media.path,
-            name: path.basename(media.path)
-          });
-        } else {
-          console.log(`File ${media.path} exceeds 25MB limit`);
+  if (content.embeddedLink?.url) {
+    //   message.content += `\n\n🔗 **[Click Here](${content.embeddedLink.url})**`;
+    message.content += `\n\n🔗 Link: ${content.embeddedLink.url}`;
+  } else {
+    // Add media attachments (Discord limit: 25MB)
+    for (const media of content.media) {
+      try {
+        if (media.path) {
+          const fileStats = await stat(media.path);
+          if (fileStats.size < 25_000_000) {
+            message.files.push({
+              attachment: media.path,
+              name: path.basename(media.path)
+            });
+
+            filesToDelete.push(media.path);
+          } else {
+            console.log(`File ${media.path} exceeds 25MB limit`);
+          }
         }
+      } catch (error) {
+        console.error(`Error processing media ${media.path}:`, error.message);
       }
-    } catch (error) {
-      console.error(`Error processing media ${media.path}:`, error.message);
     }
   }
 
   try {
-    await channel.send(message);
+    const sentMessage = await channel.send(message);
     console.log(`Posted update from ${pageName} to Discord`);
+
+    // Delete files after successful upload
+    await Promise.allSettled(
+      filesToDelete.map(async (filePath) => {
+        try {
+          await unlink(filePath);
+          console.log(`Deleted ${path.basename(filePath)}`);
+        } catch (error) {
+          console.error(`Failed to delete ${filePath}:`, error.message);
+        }
+      })
+    );
+
+    return sentMessage;
   } catch (error) {
     console.error(`Failed to send message to Discord:`, error.message);
+    throw error;
   }
 }
 
@@ -237,7 +321,7 @@ discordClient.login(config.DISCORD_TOKEN)
     async function monitoringLoop() {
       try {
         const isOnline = await checkInternetConnectivity();
-        
+
         if (isOnline) {
           console.log('✅ Internet connection available - checking pages');
           await Promise.all(config.PAGES.map(monitorPage));
