@@ -13,7 +13,7 @@
   "dependencies": {
     "axios": "^1.9.0",
     "cheerio": "^1.0.0",
-    "chromedriver": "^135.0.4",
+    "chromedriver": "140.0.4",
     "discord.js": "^14.19.2",
     "dotenv": "^16.5.0",
     "fluent-ffmpeg": "^2.1.3",

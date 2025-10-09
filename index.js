@@ -156,20 +156,30 @@ async function processWebPost(pageName) {
 
       // Handle images
       const images = post.find('img');
-      images.each(async (imgIndex, img) => {
+      for (let imgIndex = 0; imgIndex < images.length; imgIndex++) {
+        const img = images[imgIndex];
         const imageUrl = $(img).attr('src');
 
         if (imageUrl && imageUrl.startsWith('http')) {
-          // First check image size via HEAD request
-          const headResponse = await axios.head(imageUrl);
-          const contentLength = headResponse.headers['content-length'];
+          try {
+            // Check image size via HEAD request
+            const headResponse = await axios.head(imageUrl);
+            const contentLength = headResponse.headers['content-length'];
 
-          if (contentLength && parseInt(contentLength) > 2048) {
-            const imgPath = await downloadMedia(pageName, imageUrl, 'image', imgIndex);
-            content.media.push({ type: 'image', path: imgPath });
+            if (contentLength && parseInt(contentLength) > 2048) {
+              const imgPath = await downloadMedia(pageName, imageUrl, 'image', imgIndex);
+              if (imgPath) content.media.push({ type: 'image', path: imgPath });
+            }
+          } catch (error) {
+            console.error(`Error checking/downloading image: ${error.message}`);
           }
         }
-      });
+      }
+    }
+
+    // Ignore posts without image and without caption text
+    if (content.media.length === 0 && !content.text) {
+      return null;
     }
 
     // Update storage
