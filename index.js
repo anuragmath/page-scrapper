@@ -9,6 +9,10 @@ import { Client } from 'discord.js';
 import dotenv from 'dotenv';
 import ffmpeg from 'fluent-ffmpeg';
 import * as cheerio from 'cheerio';
+import fs from 'fs';
+import {PNG} from 'pngjs';
+import pixelmatch from 'pixelmatch';
+import { Jimp } from "jimp";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config();
@@ -103,6 +107,20 @@ async function processWebPost(pageName) {
     // Check for existing post
     if (storage.posts[pageName]?.url === fullPostUrl) return null;
 
+    let fullPostText = null;
+
+    if(fullPostUrl) {
+      // Navigate to the post URL to get full expanded text
+      await driver.get(fullPostUrl);
+      await driver.sleep(5000); // Wait for the page to load fully
+
+      const postPageSource = await driver.getPageSource();
+      const $$ = cheerio.load(postPageSource);
+
+      // The post on its own page will have full caption in this selector:
+      fullPostText = $$('div[data-ad-preview="message"]').text().trim();
+    }
+
     // New: Extract embedded link metadata
     const linkPreview = post.find([
       'div[data-lynx-uri]',
@@ -136,7 +154,7 @@ async function processWebPost(pageName) {
     }
     // Extract content
     const content = {
-      text: post.find('div[data-ad-preview="message"]').text().trim(),
+      text: fullPostText ? fullPostText : post.find('div[data-ad-preview="message"]').text().trim(),
       media: [],
       url: fullPostUrl,
       embeddedLink: embeddedLink, // Add embedded link metadata
@@ -177,15 +195,65 @@ async function processWebPost(pageName) {
       }
     }
 
-    // Ignore posts without image and without caption text
-    if (content.media.length === 0 && !content.text) {
+    const lastPost = storage.posts[pageName];
+
+    let isNewText = lastPost?.text !== content.text;
+
+    let isNewImage = false;
+
+    if (lastPost?.media && content.media.length > 0) {
+      for (let i = 0; i < content.media.length; i++) {
+        const newImagePath = content.media[i].path;
+        const oldImagePath = lastPost.media[i]?.path;
+
+        if (!oldImagePath) {
+          isNewImage = true;
+          break;
+        }
+
+        const imagesMatch = await compareImages(newImagePath, oldImagePath);
+        if (!imagesMatch) {
+          isNewImage = true;
+          break;
+        }
+
+        //delete image if its same 
+        try {
+          await unlink(newImagePath);
+          console.log(`Deleted same media file: ${newImagePath}`);
+        } catch (error) {
+          console.error(`Failed to delete same media file: ${newImagePath}`, error.message);
+        }
+
+      }
+    } else if ((lastPost?.media?.length || 0) !== content.media.length) {
+      isNewImage = true;
+    }
+
+    if (!isNewText && !isNewImage) {
+      // No new post, same text and images
       return null;
+    }
+
+    if (lastPost?.media?.length) {
+      for (const oldMedia of lastPost.media) {
+        if (oldMedia.path) {
+          try {
+            await unlink(oldMedia.path);
+            console.log(`Deleted old media file: ${oldMedia.path}`);
+          } catch (error) {
+            console.error(`Failed to delete old media file: ${oldMedia.path}`, error.message);
+          }
+        }
+      }
     }
 
     // Update storage
     storage.posts[pageName] = {
       url: content.url,
-      timestamp: content.timestamp
+      timestamp: content.timestamp,
+      text: content.text,
+      media: content.media
     };
     await writeFile(config.DATA_FILE, JSON.stringify(storage, null, 2));
 
@@ -255,6 +323,27 @@ function extractUrl(url) {
   }
 }
 
+async function jpgToPngBuffer(jpgPath) {
+  const image = await Jimp.read(jpgPath);
+  return await image.getBuffer("image/png");
+}
+
+async function compareImages(imgPath1, imgPath2) {
+  const imgBuffer1 = fs.readFileSync(imgPath1);
+  const imgBuffer2 = fs.readFileSync(imgPath2);
+
+  const img1PngBuffer = await jpgToPngBuffer(imgBuffer1);
+  const img2PngBuffer = await jpgToPngBuffer(imgBuffer2);
+
+  const img1 = PNG.sync.read(img1PngBuffer);
+  const img2 = PNG.sync.read(img2PngBuffer);
+
+  if (img1.width !== img2.width || img1.height !== img2.height) return false;
+
+  const diffPixels = pixelmatch(img1.data, img2.data, null, img1.width, img1.height, { threshold: 0.1 });
+  return diffPixels === 0; // true if images are visually the same
+}
+
 async function sendDiscordMessage(pageConfig, content) {
   const [pageName, channelId] = pageConfig;
   const channel = await discordClient.channels.fetch(channelId);
@@ -294,19 +383,7 @@ async function sendDiscordMessage(pageConfig, content) {
   try {
     const sentMessage = await channel.send(message);
     console.log(`Posted update from ${pageName} to Discord`);
-
-    // Delete files after successful upload
-    await Promise.allSettled(
-      filesToDelete.map(async (filePath) => {
-        try {
-          await unlink(filePath);
-          console.log(`Deleted ${path.basename(filePath)}`);
-        } catch (error) {
-          console.error(`Failed to delete ${filePath}:`, error.message);
-        }
-      })
-    );
-
+    
     return sentMessage;
   } catch (error) {
     console.error(`Failed to send message to Discord:`, error.message);
