@@ -118,7 +118,9 @@ async function processWebPost(pageName) {
       const $$ = cheerio.load(postPageSource);
 
       // The post on its own page will have full caption in this selector:
-      fullPostText = $$('div[data-ad-preview="message"]').text().trim();
+      const postText = $$('div[data-ad-preview="message"]').text().trim();
+
+      fullPostText = postText === "" ? fullPostText : postText;
     }
 
     // New: Extract embedded link metadata
@@ -154,7 +156,7 @@ async function processWebPost(pageName) {
     }
     // Extract content
     const content = {
-      text: fullPostText ? fullPostText : post.find('div[data-ad-preview="message"]').text().trim(),
+      text: fullPostText,
       media: [],
       url: fullPostUrl,
       embeddedLink: embeddedLink, // Add embedded link metadata
@@ -247,6 +249,12 @@ async function processWebPost(pageName) {
         }
       }
     }
+
+    if (!content.text && !content.media.length) {
+      // No text and image
+      return null;
+    }
+
 
     // Update storage
     storage.posts[pageName] = {
