@@ -107,7 +107,7 @@ async function processWebPost(pageName) {
     // Check for existing post
     if (storage.posts[pageName]?.url === fullPostUrl) return null;
 
-    let fullPostText = null;
+    let fullPostText = "";
 
     if(fullPostUrl) {
       // Navigate to the post URL to get full expanded text
@@ -167,11 +167,12 @@ async function processWebPost(pageName) {
       // Handle videos
       const videoElement = post.find('video');
       if (videoElement.length) {
-        const videoSrc = videoElement.attr('src');
-        if (videoSrc) {
-          const videoPath = await downloadMedia(pageName, videoSrc, 'video');
-          content.media.push({ type: 'video', path: videoPath });
-        }
+        return null;
+        // const videoSrc = videoElement.attr('src');
+        // if (videoSrc) {
+        //   const videoPath = await downloadMedia(pageName, videoSrc, 'video');
+        //   content.media.push({ type: 'video', path: videoPath });
+        // }
       }
 
       // Handle images
