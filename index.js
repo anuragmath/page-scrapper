@@ -1,6 +1,6 @@
 import { Builder } from 'selenium-webdriver';
 import chrome from 'selenium-webdriver/chrome.js';
-import { readFile, writeFile, open, stat, unlink } from 'node:fs/promises';
+import { readFile, writeFile, open, stat, unlink, mkdir } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -9,7 +9,6 @@ import { Client } from 'discord.js';
 import dotenv from 'dotenv';
 import ffmpeg from 'fluent-ffmpeg';
 import * as cheerio from 'cheerio';
-import fs from 'fs';
 import {PNG} from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import { Jimp } from "jimp";
@@ -17,9 +16,19 @@ import { Jimp } from "jimp";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config();
 
+// Fix #9: validate PAGES before using it
+let parsedPages;
+try {
+  parsedPages = JSON.parse(process.env.PAGES);
+  if (!Array.isArray(parsedPages) || parsedPages.length === 0) throw new Error('must be a non-empty array');
+} catch (e) {
+  console.error(`Invalid PAGES env var: ${e.message}. Expected format: '[["PageName","channelId"]]'`);
+  process.exit(1);
+}
+
 // Configuration
 const config = {
-  PAGES: JSON.parse(process.env.PAGES),
+  PAGES: parsedPages,
   CHECK_INTERVAL: process.env.CHECK_INTERVAL || '*/30 * * * *',
   DATA_FILE: path.join(__dirname, process.env.DATA_FILE || 'storage.json'),
   MEDIA_DIR: path.join(__dirname, process.env.MEDIA_DIR || 'media'),
@@ -28,6 +37,9 @@ const config = {
   FFMPEG_PATH: process.env.FFMPEG_PATH || 'ffmpeg',
   FB_URL: process.env.FB_URL
 };
+
+// Fix #6: ensure MEDIA_DIR exists before any downloads
+await mkdir(config.MEDIA_DIR, { recursive: true });
 
 // Initialize Discord
 const discordClient = new Client({
@@ -42,6 +54,7 @@ try {
 
 // Configure browser
 const chromeOptions = new chrome.Options()
+  .setChromeBinaryPath(process.env.CHROME_BINARY || '/usr/bin/chromium')
   .windowSize({ width: 1280, height: 720 })
   .addArguments('--disable-notifications');
 
@@ -53,14 +66,16 @@ const CONNECTIVITY_ENDPOINTS = [
   'http://www.cloudflare.com'
 ];
 
-// Convert cron pattern to milliseconds
+// Fix #8: improved error message for unsupported cron patterns
 function parseCheckInterval(cronPattern) {
   const cronParts = cronPattern.split(' ');
   if (cronParts[0].startsWith('*/')) {
     const minutes = parseInt(cronParts[0].substring(2));
     return minutes * 60 * 1000;
   }
-  throw new Error('Only simple interval cron patterns are supported');
+  throw new Error(
+    `Unsupported CHECK_INTERVAL pattern "${cronPattern}". Only "*/N * * * *" (every-N-minutes) patterns are supported.`
+  );
 }
 
 const checkIntervals = {
@@ -123,10 +138,10 @@ async function processWebPost(pageName) {
       fullPostText = postText === "" ? fullPostText : postText;
     }
 
-    // New: Extract embedded link metadata
+    // Extract embedded link metadata
     const linkPreview = post.find([
       'div[data-lynx-uri]',
-      'div.x1lq5wgf', // Example class-based selector
+      'div.x1lq5wgf',
       'a[role="link"][target="_blank"]'
     ].join(',')).first();
 
@@ -134,17 +149,19 @@ async function processWebPost(pageName) {
 
     if (linkPreview.length) {
       try {
-        const rawUrl = linkPreview.attr('data-lynx-uri') ||
-          linkPreview.find('a').attr('href') ||
+        // Fix #3: guard against undefined rawUrl before decoding
+        const rawUrl = linkPreview.attr('data-lynx-uri') ??
+          linkPreview.find('a').attr('href') ??
           linkPreview.closest('a').attr('href');
+
+        if (!rawUrl) throw new Error('No URL found in link preview element');
 
         embeddedLink = {
           url: extractUrl(decodeURIComponent(rawUrl)),
-          // Keep existing title/image extraction if needed
         };
 
-        // Special case for image-only links
-        if (!embeddedLink.url.startsWith('http')) {
+        // Fix #7: null-guard embeddedLink.url before calling startsWith
+        if (embeddedLink.url && !embeddedLink.url.startsWith('http')) {
           const imgParentLink = linkPreview.find('img').closest('a').attr('href');
           if (imgParentLink) {
             embeddedLink.url = extractUrl(imgParentLink);
@@ -154,12 +171,13 @@ async function processWebPost(pageName) {
         console.error('Link processing error:', error);
       }
     }
+
     // Extract content
     const content = {
       text: fullPostText,
       media: [],
       url: fullPostUrl,
-      embeddedLink: embeddedLink, // Add embedded link metadata
+      embeddedLink: embeddedLink,
       timestamp: new Date().toISOString()
     };
 
@@ -220,21 +238,23 @@ async function processWebPost(pageName) {
           break;
         }
 
-        //delete image if its same 
         try {
           await unlink(newImagePath);
           console.log(`Deleted same media file: ${newImagePath}`);
         } catch (error) {
           console.error(`Failed to delete same media file: ${newImagePath}`, error.message);
         }
-
       }
     } else if ((lastPost?.media?.length || 0) !== content.media.length) {
       isNewImage = true;
     }
 
     if (!isNewText && !isNewImage) {
-      // No new post, same text and images
+      return null;
+    }
+
+    // Fix #2: validate content before deleting old media, so storage stays consistent on early return
+    if (!content.text && !content.media.length) {
       return null;
     }
 
@@ -250,12 +270,6 @@ async function processWebPost(pageName) {
         }
       }
     }
-
-    if (!content.text && !content.media.length) {
-      // No text and image
-      return null;
-    }
-
 
     // Update storage
     storage.posts[pageName] = {
@@ -332,14 +346,18 @@ function extractUrl(url) {
   }
 }
 
-async function jpgToPngBuffer(jpgPath) {
-  const image = await Jimp.read(jpgPath);
+// Fix #5: accept buffer (not path) — Jimp.read handles both, but compareImages passes buffers
+async function jpgToPngBuffer(imgBuffer) {
+  const image = await Jimp.read(imgBuffer);
   return await image.getBuffer("image/png");
 }
 
+// Fix #4: use async readFile instead of blocking readFileSync
 async function compareImages(imgPath1, imgPath2) {
-  const imgBuffer1 = fs.readFileSync(imgPath1);
-  const imgBuffer2 = fs.readFileSync(imgPath2);
+  const [imgBuffer1, imgBuffer2] = await Promise.all([
+    readFile(imgPath1),
+    readFile(imgPath2)
+  ]);
 
   const img1PngBuffer = await jpgToPngBuffer(imgBuffer1);
   const img2PngBuffer = await jpgToPngBuffer(imgBuffer2);
@@ -350,7 +368,7 @@ async function compareImages(imgPath1, imgPath2) {
   if (img1.width !== img2.width || img1.height !== img2.height) return false;
 
   const diffPixels = pixelmatch(img1.data, img2.data, null, img1.width, img1.height, { threshold: 0.1 });
-  return diffPixels === 0; // true if images are visually the same
+  return diffPixels === 0;
 }
 
 async function sendDiscordMessage(pageConfig, content) {
@@ -364,7 +382,6 @@ async function sendDiscordMessage(pageConfig, content) {
   };
 
   if (content.embeddedLink?.url) {
-    //   message.content += `\n\n🔗 **[Click Here](${content.embeddedLink.url})**`;
     message.content += `\n\n🔗 Link: ${content.embeddedLink.url}`;
   } else {
     // Add media attachments (Discord limit: 25MB)
@@ -392,7 +409,12 @@ async function sendDiscordMessage(pageConfig, content) {
   try {
     const sentMessage = await channel.send(message);
     console.log(`Posted update from ${pageName} to Discord`);
-    
+
+    // Fix #1: delete uploaded media files after successful send
+    for (const filePath of filesToDelete) {
+      await unlink(filePath).catch(e => console.error(`Failed to delete ${filePath}:`, e.message));
+    }
+
     return sentMessage;
   } catch (error) {
     console.error(`Failed to send message to Discord:`, error.message);
