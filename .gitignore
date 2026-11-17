@@ -1,3 +1,7 @@
 node_modules
 .env
 package-lock.json
+# Runtime state
+posts.json
+media/
+images/
