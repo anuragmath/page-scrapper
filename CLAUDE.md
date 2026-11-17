@@ -40,20 +40,20 @@ All logic lives in `index.js` (ESM, single file). The main loop:
    - Follows the post URL to get the full post text
    - Runs `extractUrl()` to unwrap Facebook's redirect encoding on embedded links
    - Downloads media via axios streaming; processes video with fluent-ffmpeg
-   - Compares new content against `posts.json` state: text diff and pixel-level image comparison via `compareImages()` (pixelmatch + pngjs/jpeg-js)
+   - Computes a perceptual hash (Jimp `pHash`) per image and compares text + hashes against the page's recently sent posts
    - Returns content object if changed, `null` if unchanged
 3. **Discord dispatch** via `sendDiscordMessage()` — formats and sends message with attachments (respects 25MB file / 2000-char limits)
-4. **Commit** via `commitPost()` — only after a successful send: saves state and deletes the *previous* post's media. If the send fails, nothing is saved and the post is retried next cycle.
+4. **Commit** via `commitPost()` — only after a successful send: records the post's fingerprint and deletes its media files. If the send fails, nothing is saved and the post is retried next cycle.
 
 Pages are processed sequentially (one Chrome instance at a time).
 
-**State storage:** `posts.json` tracks the last-seen post per page (URL, text, media filenames relative to `MEDIA_DIR`, timestamp). The latest post's media stays on disk so the next check can pixel-compare against it.
+**State storage:** `posts.json` keeps, per page, a `recent` list of the last 20 sent posts (`urls`, `text`, image `hashes`, `timestamp`). Media is not kept on disk after sending. Old single-post entries are converted by `migrateStorage()` at startup.
 
-**Change detection:** A post is considered new if the URL changed, the text changed, or `compareImages()` returns non-identical (0 diff pixels with 0.1 threshold). Video posts skip the image comparison check.
+**Change detection:** Facebook `pfbid` post URLs are not stable across loads, so a URL match is only a shortcut. A post is a duplicate if any recent entry has identical text and the same number of images, each within `HASH_DISTANCE_THRESHOLD` (0.1) pHash distance. This matters most for image-only posts, where there is no caption to compare. Video posts are skipped entirely.
 
 ## Key Patterns
 
 - The project uses ES Modules (`"type": "module"` in package.json) — use `import`/`export`, not `require`.
 - `parseCheckInterval(cronPattern)` converts the cron `CHECK_INTERVAL` env var to milliseconds for `setInterval`.
-- Media files are downloaded to `MEDIA_DIR`; the latest post's files are kept for comparison, older ones are deleted when replaced. A missing/unreadable old image is treated as "different".
+- Media files are downloaded to `MEDIA_DIR` and deleted after sending (or immediately if the post is a duplicate). An image that fails to hash never matches, so it is treated as new.
 - `node-cron` is listed as a dependency but is not currently used — scheduling is done with `setInterval`.

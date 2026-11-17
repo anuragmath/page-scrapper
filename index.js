@@ -9,9 +9,7 @@ import { Client } from 'discord.js';
 import dotenv from 'dotenv';
 import ffmpeg from 'fluent-ffmpeg';
 import * as cheerio from 'cheerio';
-import {PNG} from 'pngjs';
-import pixelmatch from 'pixelmatch';
-import { Jimp } from "jimp";
+import { Jimp, compareHashes } from "jimp";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config();
@@ -177,8 +175,9 @@ async function processWebPost(pageName) {
     const postUrl = post.find('a[href*="/posts/"]').attr('href')?.split('?')[0];
     const fullPostUrl = postUrl ? `${postUrl}` : null;
 
-    // Check for existing post
-    if (storage.posts[pageName]?.url === fullPostUrl) {
+    // Check for existing post. Facebook's pfbid URLs aren't stable, so a miss here
+    // just means we fall through to the content fingerprint check below.
+    if (fullPostUrl && getRecent(pageName).some(r => r.urls?.includes(fullPostUrl))) {
       console.log(`[${pageName}] No new post`);
       return null;
     }
@@ -281,35 +280,24 @@ async function processWebPost(pageName) {
       }
     }
 
-    const lastPost = storage.posts[pageName];
-
-    let isNewText = lastPost?.text !== content.text;
-
-    const newMediaPaths = content.media.map(m => m.path);
-    const oldMedia = lastPost?.media || [];
-
-    // Compare every image before deciding anything, so no file needed for sending gets deleted early
-    let isNewImage = oldMedia.length !== content.media.length;
-    for (let i = 0; !isNewImage && i < content.media.length; i++) {
-      const oldPath = oldMedia[i]?.path;
-      if (!oldPath || !(await compareImages(content.media[i].path, resolveMediaPath(oldPath)))) {
-        isNewImage = true;
-      }
-    }
-
-    if (!isNewText && !isNewImage) {
-      // Same content under a new URL: remember the URL so we skip re-scraping it next time
-      await deleteFiles(newMediaPaths, 'duplicate');
-      if (lastPost && fullPostUrl) {
-        lastPost.url = fullPostUrl;
-        await saveStorage();
-      }
-      console.log(`[${pageName}] New URL but same content as last post, skipping`);
+    if (!content.text && !content.media.length) {
+      console.log(`[${pageName}] Post has no text or media, skipping`);
       return null;
     }
 
-    if (!content.text && !content.media.length) {
-      console.log(`[${pageName}] Post has no text or media, skipping`);
+    // Perceptual hashes survive Facebook re-encoding/resizing the same image, unlike exact pixel matching
+    for (const m of content.media) {
+      m.hash = await imageHash(m.path);
+    }
+
+    const match = getRecent(pageName).find(r => isSameContent(r, content));
+    if (match) {
+      await deleteFiles(downloadedPaths, 'duplicate');
+      if (fullPostUrl && !match.urls?.includes(fullPostUrl)) {
+        match.urls = [fullPostUrl, ...(match.urls || [])].slice(0, MAX_URLS_PER_POST);
+        await saveStorage();
+      }
+      console.log(`[${pageName}] Same content as an already-sent post, skipping`);
       return null;
     }
 
@@ -386,39 +374,50 @@ function extractUrl(url) {
   }
 }
 
-// Fix #5: accept buffer (not path) — Jimp.read handles both, but compareImages passes buffers
-async function jpgToPngBuffer(imgBuffer) {
-  const image = await Jimp.read(imgBuffer);
-  return await image.getBuffer("image/png");
-}
-
-// Fix #4: use async readFile instead of blocking readFileSync
-// Returns true only when both images exist and are pixel-identical; any read/decode failure counts as "different"
-async function compareImages(imgPath1, imgPath2) {
+async function imageHash(imgPath) {
   try {
-    return await compareImageFiles(imgPath1, imgPath2);
+    return (await Jimp.read(imgPath)).pHash();
   } catch (error) {
-    console.warn(`Image comparison failed (treating as new): ${error.message}`);
-    return false;
+    console.warn(`Image hashing failed for ${imgPath}: ${error.message}`);
+    return null;
   }
 }
 
-async function compareImageFiles(imgPath1, imgPath2) {
-  const [imgBuffer1, imgBuffer2] = await Promise.all([
-    readFile(imgPath1),
-    readFile(imgPath2)
-  ]);
+// Same image re-encoded or resized by the CDN scores ~0; different images (even same comic style) score >0.15
+const HASH_DISTANCE_THRESHOLD = 0.1;
+const MAX_RECENT_POSTS = 20;
+const MAX_URLS_PER_POST = 10;
 
-  const img1PngBuffer = await jpgToPngBuffer(imgBuffer1);
-  const img2PngBuffer = await jpgToPngBuffer(imgBuffer2);
+function isSameContent(seen, content) {
+  if ((seen.text || '') !== (content.text || '')) return false;
+  const oldHashes = seen.hashes || [];
+  if (oldHashes.length !== content.media.length) return false;
+  return content.media.every((m, i) =>
+    m.hash && oldHashes[i] && compareHashes(m.hash, oldHashes[i]) <= HASH_DISTANCE_THRESHOLD
+  );
+}
 
-  const img1 = PNG.sync.read(img1PngBuffer);
-  const img2 = PNG.sync.read(img2PngBuffer);
+function getRecent(pageName) {
+  return storage.posts[pageName]?.recent || [];
+}
 
-  if (img1.width !== img2.width || img1.height !== img2.height) return false;
-
-  const diffPixels = pixelmatch(img1.data, img2.data, null, img1.width, img1.height, { threshold: 0.1 });
-  return diffPixels === 0;
+// Older state files only stored the last post (with media files on disk); turn that into a fingerprint
+async function migrateStorage() {
+  let changed = false;
+  for (const [pageName, entry] of Object.entries(storage.posts)) {
+    if (entry.recent) continue;
+    const hashes = [];
+    for (const m of entry.media || []) {
+      const p = resolveMediaPath(m.path);
+      hashes.push(await imageHash(p));
+      await deleteFiles([p], 'migrated');
+    }
+    storage.posts[pageName] = {
+      recent: [{ urls: entry.url ? [entry.url] : [], text: entry.text || '', hashes, timestamp: entry.timestamp }]
+    };
+    changed = true;
+  }
+  if (changed) await saveStorage();
 }
 
 async function sendDiscordMessage(pageConfig, content) {
@@ -467,24 +466,18 @@ async function sendDiscordMessage(pageConfig, content) {
   return sentMessage;
 }
 
-// Record the post as seen. The new media files are kept on disk so the next
-// check can compare against them; the previous post's media is removed.
+// Record the post's fingerprint as seen and drop its media files (only the hashes are needed later).
 async function commitPost(pageName, content) {
-  const lastPost = storage.posts[pageName];
-  const keep = new Set(content.media.map(m => m.path));
-  const oldPaths = (lastPost?.media || [])
-    .filter(m => m.path)
-    .map(m => resolveMediaPath(m.path))
-    .filter(p => !keep.has(p));
-  await deleteFiles(oldPaths, 'old');
-
-  storage.posts[pageName] = {
-    url: content.url,
-    timestamp: content.timestamp,
+  const recent = getRecent(pageName);
+  recent.unshift({
+    urls: content.url ? [content.url] : [],
     text: content.text,
-    media: content.media.map(m => ({ type: m.type, path: path.basename(m.path) }))
-  };
+    hashes: content.media.map(m => m.hash),
+    timestamp: content.timestamp
+  });
+  storage.posts[pageName] = { recent: recent.slice(0, MAX_RECENT_POSTS) };
   await saveStorage();
+  await deleteFiles(content.media.map(m => m.path), 'sent');
 }
 
 async function monitorPage(pageConfig) {
@@ -506,6 +499,8 @@ async function monitorPage(pageConfig) {
     }
   }
 }
+
+await migrateStorage();
 
 // Start monitoring with connectivity checks
 discordClient.login(config.DISCORD_TOKEN)
