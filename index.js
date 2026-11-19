@@ -77,9 +77,17 @@ async function deleteFiles(filePaths, label) {
 const chromeOptions = new chrome.Options()
   .setChromeBinaryPath(process.env.CHROME_BINARY || '/usr/bin/chromium')
   .windowSize({ width: 1280, height: 720 })
-  .addArguments('--disable-notifications');
+  .addArguments(
+    '--disable-notifications',
+    // /dev/shm is tiny on many servers/containers; Facebook pages exhaust it and crash the renderer
+    '--disable-dev-shm-usage',
+    '--disable-gpu'
+  );
 
-if (config.HEADLESS) chromeOptions.addArguments('--headless');
+if (config.HEADLESS) chromeOptions.addArguments('--headless=new');
+
+// Chrome crashed or the renderer died mid-scrape; worth one fresh-browser retry
+const BROWSER_CRASH = /invalid session id|disconnected|chrome not reachable|session deleted|renderer/i;
 
 // Connectivity check endpoints
 const CONNECTIVITY_ENDPOINTS = [
@@ -308,7 +316,8 @@ async function processWebPost(pageName) {
     await deleteFiles(downloadedPaths, 'orphaned');
     throw error;
   } finally {
-    await driver.quit();
+    // quit() throws on a crashed session; don't let that mask the real error
+    await driver.quit().catch(() => {});
   }
 }
 
@@ -485,14 +494,20 @@ async function monitorPage(pageConfig) {
   let content = null;
   let sent = false;
   try {
-    content = await processWebPost(pageName);
+    try {
+      content = await processWebPost(pageName);
+    } catch (error) {
+      if (!BROWSER_CRASH.test(error.message)) throw error;
+      console.warn(`[${pageName}] Browser crashed (${error.message.split('\n')[0]}), retrying once`);
+      content = await processWebPost(pageName);
+    }
     if (!content) return;
     await sendDiscordMessage(pageConfig, content);
     sent = true;
     await commitPost(pageName, content);
   } catch (error) {
     // Selenium errors carry a huge remote stack trace; the first line is what matters
-    console.error(`Error processing ${pageName}:`, error.name === 'WebDriverError' ? error.message.split('\n')[0] : error);
+    console.error(`Error processing ${pageName}:`, (error.name === 'WebDriverError' || error.name === 'NoSuchSessionError') ? error.message.split('\n')[0] : error);
     // Send failed: drop this attempt's files; the post will be retried next check
     if (content && !sent) {
       await deleteFiles(content.media.map(m => m.path), 'unsent');
