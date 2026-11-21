@@ -1,7 +1,9 @@
 import { Builder, By, until } from 'selenium-webdriver';
 import chrome from 'selenium-webdriver/chrome.js';
-import { readFile, writeFile, open, stat, unlink, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, open, stat, unlink, mkdir, mkdtemp, rm, readdir } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
+import { execFile } from 'node:child_process';
+import os from 'node:os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
@@ -73,21 +75,65 @@ async function deleteFiles(filePaths, label) {
   }
 }
 
-// Configure browser
-const chromeOptions = new chrome.Options()
-  .setChromeBinaryPath(process.env.CHROME_BINARY || '/usr/bin/chromium')
-  .windowSize({ width: 1280, height: 720 })
-  .addArguments(
-    '--disable-notifications',
-    // /dev/shm is tiny on many servers/containers; Facebook pages exhaust it and crash the renderer
-    '--disable-dev-shm-usage',
-    '--disable-gpu'
-  );
+// Configure browser. Each run gets its own throwaway profile dir so a crashed Chrome can't
+// leave a stale/empty DevToolsActivePort file (or a locked profile) for the next launch.
+const PROFILE_PREFIX = 'fb-scraper-chrome-';
 
-if (config.HEADLESS) chromeOptions.addArguments('--headless=new');
+function buildChromeOptions(profileDir) {
+  const options = new chrome.Options()
+    .setChromeBinaryPath(process.env.CHROME_BINARY || '/usr/bin/chromium')
+    .windowSize({ width: 1280, height: 720 })
+    .addArguments(
+      `--user-data-dir=${profileDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-notifications',
+      // /dev/shm is tiny on many servers/containers; Facebook pages exhaust it and crash the renderer
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    );
+  if (config.HEADLESS) options.addArguments('--headless=new');
+  return options;
+}
 
-// Chrome crashed or the renderer died mid-scrape; worth one fresh-browser retry
-const BROWSER_CRASH = /invalid session id|disconnected|chrome not reachable|session deleted|renderer/i;
+// Kill any Chrome processes still using a profile dir. When a session crashes, quit() fails and
+// chromedriver is stopped, but Chrome itself can be orphaned and pile up until launches start failing.
+function killChromeUsing(pattern) {
+  return new Promise(resolve => execFile('pkill', ['-f', '--', pattern], () => resolve()));
+}
+
+async function launchBrowser() {
+  const profileDir = await mkdtemp(path.join(os.tmpdir(), PROFILE_PREFIX));
+  try {
+    const driver = await new Builder()
+      .forBrowser('chrome')
+      .setChromeOptions(buildChromeOptions(profileDir))
+      .build();
+    return { driver, profileDir };
+  } catch (error) {
+    await cleanupBrowser(null, profileDir);
+    throw error;
+  }
+}
+
+async function cleanupBrowser(driver, profileDir) {
+  // quit() throws on a crashed session; don't let that mask the real error
+  if (driver) await driver.quit().catch(() => {});
+  await killChromeUsing(profileDir);
+  await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+}
+
+// Clear out leftovers from a previous run that was killed or crashed
+async function cleanupStaleBrowsers() {
+  await killChromeUsing(path.join(os.tmpdir(), PROFILE_PREFIX));
+  const entries = await readdir(os.tmpdir()).catch(() => []);
+  await Promise.all(entries
+    .filter(name => name.startsWith(PROFILE_PREFIX))
+    .map(name => rm(path.join(os.tmpdir(), name), { recursive: true, force: true }).catch(() => {})));
+}
+
+// Chrome crashed, the renderer died mid-scrape, or Chrome failed to start; worth one fresh-browser retry
+const BROWSER_CRASH = /invalid session id|disconnected|chrome not reachable|session deleted|renderer|session not created|DevTools/i;
 
 // Connectivity check endpoints
 const CONNECTIVITY_ENDPOINTS = [
@@ -152,10 +198,7 @@ async function withHttpRetry(fn, attempts = 3) {
 }
 
 async function processWebPost(pageName) {
-  const driver = await new Builder()
-    .forBrowser('chrome')
-    .setChromeOptions(chromeOptions)
-    .build();
+  const { driver, profileDir } = await launchBrowser();
   const downloadedPaths = [];
 
   try {
@@ -316,8 +359,7 @@ async function processWebPost(pageName) {
     await deleteFiles(downloadedPaths, 'orphaned');
     throw error;
   } finally {
-    // quit() throws on a crashed session; don't let that mask the real error
-    await driver.quit().catch(() => {});
+    await cleanupBrowser(driver, profileDir);
   }
 }
 
@@ -507,7 +549,7 @@ async function monitorPage(pageConfig) {
     await commitPost(pageName, content);
   } catch (error) {
     // Selenium errors carry a huge remote stack trace; the first line is what matters
-    console.error(`Error processing ${pageName}:`, (error.name === 'WebDriverError' || error.name === 'NoSuchSessionError') ? error.message.split('\n')[0] : error);
+    console.error(`Error processing ${pageName}:`, (error.name === 'WebDriverError' || error.name === 'NoSuchSessionError' || error.name === 'SessionNotCreatedError') ? error.message.split('\n')[0] : error);
     // Send failed: drop this attempt's files; the post will be retried next check
     if (content && !sent) {
       await deleteFiles(content.media.map(m => m.path), 'unsent');
@@ -516,6 +558,7 @@ async function monitorPage(pageConfig) {
 }
 
 await migrateStorage();
+await cleanupStaleBrowsers();
 
 // Start monitoring with connectivity checks
 discordClient.login(config.DISCORD_TOKEN)
